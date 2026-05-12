@@ -208,22 +208,4 @@ Output: "machine learning helps business improve productivity"
 6. Filter invalid/low-probability tokens
 7. Return results with confidence scores
 
-## 📄 License
 
-This project is created for educational purposes.
-
-## 👨‍💻 Development
-
-Last Updated: May 2026
-Model Version: 1.1 (Retrained with expanded dataset)
-
-## 📞 Support
-
-For issues or questions:
-1. Check the Troubleshooting section
-2. Verify all dependencies are installed
-3. Ensure dataset.txt exists and is properly formatted
-
----
-
-**Enjoy predicting next words! 🚀**
