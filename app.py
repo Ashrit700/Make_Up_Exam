@@ -1,216 +1,173 @@
 import streamlit as st
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Embedding, LSTM, Dense
 import matplotlib.pyplot as plt
+import json
+import pickle
 import os
 
 st.set_page_config(page_title="Next Word Predictor", layout="wide")
 
-st.title("Next Word Prediction using LSTM")
-st.markdown("Developed for the Next Word Prediction project.")
+st.title("🔮 Next Word Prediction with LSTM")
+st.markdown("Complete sentences and predict next words using a trained LSTM model.")
 
-# Utility functions to cache the dataset loading and preprocessing
+# Load model and artifacts
+@st.cache_resource
+def load_model_and_tokenizer():
+    model = tf.keras.models.load_model("saved_model/next_word_lstm.keras")
+    with open("saved_model/tokenizer.pkl", "rb") as f:
+        tokenizer = pickle.load(f)
+    with open("saved_model/metadata.json", "r") as f:
+        metadata = json.load(f)
+    return model, tokenizer, metadata
+
 @st.cache_data
-def load_dataset(file_path):
-    if not os.path.exists(file_path):
-        return None
-    with open(file_path, "r", encoding="utf-8") as f:
-        text = f.read()
-    sentences = text.split("\n")
-    sentences = [s.strip() for s in sentences if s.strip()]
-    return sentences
+def load_training_history():
+    with open("saved_model/history.json", "r") as f:
+        history = json.load(f)
+    return history
 
-@st.cache_data
-def preprocess_text(sentences):
-    tokenizer = Tokenizer()
-    # Fit on texts (lowercasing and tokenization happens here automatically)
-    tokenizer.fit_on_texts(sentences)
-    total_words = len(tokenizer.word_index) + 1
-    
-    # Sequence generation
-    input_sequences = []
-    for line in sentences:
-        token_list = tokenizer.texts_to_sequences([line])[0]
-        for i in range(1, len(token_list)):
-            n_gram_sequence = token_list[:i+1]
-            input_sequences.append(n_gram_sequence)
-            
-    # Padding sequences
-    max_sequence_len = max([len(x) for x in input_sequences]) if input_sequences else 0
-    input_sequences = np.array(pad_sequences(input_sequences, maxlen=max_sequence_len, padding='pre'))
-    
-    X, y = input_sequences[:,:-1], input_sequences[:,-1]
-    y = tf.keras.utils.to_categorical(y, num_classes=total_words)
-    
-    return tokenizer, max_sequence_len, total_words, X, y, input_sequences
-
-# Model building and training
-def build_and_train_model(X, y, max_sequence_len, total_words, epochs=50):
-    model = Sequential()
-    model.add(Embedding(input_dim=total_words, output_dim=100, input_length=max_sequence_len-1))
-    model.add(LSTM(150))
-    model.add(Dense(total_words, activation='softmax'))
-    
-    model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
-    
-    # Create an empty placeholder for the progress bar
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # Custom callback to update Streamlit UI during training
-    class StreamlitCallback(tf.keras.callbacks.Callback):
-        def on_epoch_end(self, epoch, logs=None):
-            progress = (epoch + 1) / epochs
-            progress_bar.progress(progress)
-            status_text.text(f"Epoch {epoch+1}/{epochs} - Loss: {logs['loss']:.4f} - Accuracy: {logs['accuracy']:.4f}")
-
-    history = model.fit(X, y, epochs=epochs, verbose=0, callbacks=[StreamlitCallback()])
-    
-    return model, history
-
-# Prediction
-def predict_next_words(model, tokenizer, max_sequence_len, text, top_k=3):
-    token_list = tokenizer.texts_to_sequences([text])[0]
-    token_list = pad_sequences([token_list], maxlen=max_sequence_len-1, padding='pre')
-    predicted_probs = model.predict(token_list, verbose=0)[0]
-    
-    # Get top k indices
-    top_indices = np.argsort(predicted_probs)[-top_k:][::-1]
-    
-    results = []
-    for idx in top_indices:
-        word = next((w for w, i in tokenizer.word_index.items() if i == idx), None)
-        if word:
-            results.append((word, predicted_probs[idx]))
-            
-    return results
-
-# Autocomplete
-def autocomplete_sentence(model, tokenizer, max_sequence_len, text, words_to_add=3):
-    for _ in range(words_to_add):
+# Prediction function
+def predict_next_words(model, tokenizer, metadata, text, top_k=3):
+    max_sequence_len = metadata["max_sequence_len"]
+    try:
         token_list = tokenizer.texts_to_sequences([text])[0]
+        if not token_list:  # Handle unknown words
+            return []
         token_list = pad_sequences([token_list], maxlen=max_sequence_len-1, padding='pre')
         predicted_probs = model.predict(token_list, verbose=0)[0]
-        predicted_idx = np.argmax(predicted_probs)
-        word = next((w for w, i in tokenizer.word_index.items() if i == predicted_idx), None)
-        if word:
-            text += " " + word
+        
+        # Filter out low-probability predictions and padding token (index 0)
+        min_prob = 0.01
+        valid_indices = np.where((predicted_probs > min_prob) & (np.arange(len(predicted_probs)) != 0))[0]
+        
+        if len(valid_indices) == 0:
+            top_indices = np.argsort(predicted_probs)[-top_k:][::-1]
         else:
+            top_indices = valid_indices[np.argsort(predicted_probs[valid_indices])[-top_k:][::-1]]
+        
+        results = []
+        for idx in top_indices:
+            if idx == 0:  # Skip padding token
+                continue
+            word = next((w for w, i in tokenizer.word_index.items() if i == idx), None)
+            if word and word.strip():  # Only valid, non-empty words
+                results.append((word, float(predicted_probs[idx])))
+        return results
+    except Exception as e:
+        st.warning(f"Could not generate predictions: {str(e)}")
+        return []
+
+# Autocomplete function
+def autocomplete_sentence(model, tokenizer, metadata, text, words_to_add=3):
+    max_sequence_len = metadata["max_sequence_len"]
+    completed = text
+    for _ in range(words_to_add):
+        try:
+            token_list = tokenizer.texts_to_sequences([completed])[0]
+            if not token_list:  # Handle unknown words
+                break
+            token_list = pad_sequences([token_list], maxlen=max_sequence_len-1, padding='pre')
+            predicted_probs = model.predict(token_list, verbose=0)[0]
+            
+            # Find highest probability that's not padding token (index 0)
+            valid_mask = np.arange(len(predicted_probs)) != 0
+            valid_probs = predicted_probs.copy()
+            valid_probs[~valid_mask] = -1
+            
+            predicted_idx = np.argmax(valid_probs)
+            if predicted_probs[predicted_idx] < 0.01:  # Skip if probability too low
+                break
+                
+            word = next((w for w, i in tokenizer.word_index.items() if i == predicted_idx), None)
+            if word and word.strip():  # Only valid, non-empty words
+                completed += " " + word
+            else:
+                break
+        except Exception as e:
             break
-    return text
+    return completed
 
-# UI
-tab1, tab2, tab3, tab4 = st.tabs(["Task 1 & 2: Dataset & Preprocessing", "Task 3: LSTM Model", "Task 4: Next Word Prediction", "Task 5: Performance Visualization"])
-
-dataset_path = "dataset.txt"
-sentences = load_dataset(dataset_path)
-
-if sentences:
-    tokenizer, max_seq_len, total_vocab, X, y, input_seqs = preprocess_text(sentences)
+# Load model and data
+try:
+    model, tokenizer, metadata = load_model_and_tokenizer()
+    history = load_training_history()
+    
+    # Create tabs
+    tab1, tab2, tab3 = st.tabs(["📝 Predict Next Word", "✍️ Complete Sentence", "📊 Model Evaluation"])
     
     with tab1:
-        st.header("Task 1: Dataset Creation & Task 2: NLP Preprocessing")
-        st.write(f"Loaded **{len(sentences)}** meaningful sentences from `{dataset_path}`.")
+        st.header("Predict Next Word")
+        st.write("Enter a sentence fragment and get the top predicted next words with confidence scores.")
         
-        st.subheader("NLP Preprocessing Metrics")
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total Vocabulary Size", total_vocab)
-        col2.metric("Maximum Sequence Length", max_seq_len)
-        col3.metric("Total Sequences Generated", len(input_seqs))
+        user_text = st.text_input("Enter text:", placeholder="e.g., 'artificial intelligence is'", key="predict_input")
         
-        st.subheader("Sample Processed Sequences (Padded)")
-        st.write("Below are the numerical representations of the generated n-gram sequences, padded to the maximum sequence length:")
-        st.code(input_seqs[:5])
-        
-        st.subheader("Vocabulary Mapping (Sample)")
-        st.write("A peek into the tokenized vocabulary (Word -> Index Mapping):")
-        sample_vocab = dict(list(tokenizer.word_index.items())[:20])
-        st.json(sample_vocab)
-        
-    with tab2:
-        st.header("Task 3: LSTM Model Development")
-        st.write("This tab allows you to train the deep learning model. The architecture is as follows:")
-        st.code('''
-model = Sequential()
-model.add(Embedding(input_dim=total_vocab, output_dim=100, input_length=max_sequence_len-1))
-model.add(LSTM(150))
-model.add(Dense(total_vocab, activation='softmax'))
-model.compile(loss='categorical_crossentropy', optimizer='adam', metrics=['accuracy'])
-        ''', language='python')
-        
-        epochs = st.slider("Select Epochs for Training", min_value=10, max_value=200, value=50, step=10)
-        
-        if st.button("Train Model"):
-            with st.spinner("Initializing Training..."):
-                model, history = build_and_train_model(X, y, max_seq_len, total_vocab, epochs=epochs)
-                st.session_state['model'] = model
-                st.session_state['history'] = history.history
-            st.success("Model trained successfully! You can now predict words and view visualizations.")
-
-    with tab3:
-        st.header("Task 4: Next Word Prediction")
-        
-        if 'model' not in st.session_state:
-            st.warning("⚠️ Please train the model first in the 'Task 3: LSTM Model' tab.")
-        else:
-            model = st.session_state['model']
-            
-            st.write("Enter a sentence fragment (e.g., 'Artificial Intelligence is', 'Machine learning can')")
-            user_input = st.text_input("Sentence Fragment", "Artificial Intelligence is")
-            
-            if st.button("Predict Next Word", type="primary"):
-                if user_input.strip() == "":
-                    st.error("Please enter some text.")
+        if user_text:
+            try:
+                predictions = predict_next_words(model, tokenizer, metadata, user_text, top_k=5)
+                if predictions:
+                    st.success(f"✓ Top predictions for: **{user_text}**")
+                    cols = st.columns(len(predictions))
+                    for i, (word, prob) in enumerate(predictions):
+                        with cols[i]:
+                            st.metric(label=f"#{i+1}", value=word, delta=f"{prob*100:.1f}%")
                 else:
-                    predictions = predict_next_words(model, tokenizer, max_seq_len, user_input, top_k=3)
-                    
-                    if predictions:
-                        top_word = predictions[0][0]
-                        st.success(f"**Predicted Next Word:** `{top_word}`")
-                        
-                        st.subheader("Top-3 Predicted Words (Optional Task 5)")
-                        for i, (word, prob) in enumerate(predictions):
-                            st.write(f"**{i+1}. {word}** ({prob*100:.2f}%)")
-                            st.progress(float(prob))
-                            
-                        st.subheader("Sentence Auto-completion (Optional Task 5)")
-                        words_to_add = st.slider("Number of words to auto-complete", 1, 10, 3)
-                        completed = autocomplete_sentence(model, tokenizer, max_seq_len, user_input, words_to_add=words_to_add)
-                        st.info(f"**Auto-completed Sentence:** {completed}")
-                    else:
-                        st.error("Could not predict the next word. The word might not be in the vocabulary.")
-                        
-    with tab4:
-        st.header("Task 5: Performance Visualization")
-        if 'history' not in st.session_state:
-            st.warning("⚠️ Please train the model first in the 'Task 3: LSTM Model' tab to view visualizations.")
-        else:
-            history = st.session_state['history']
-            
-            st.write("Below are the Training Accuracy and Loss graphs recorded during the model training phase.")
-            
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-            
-            # Accuracy plot
-            ax1.plot(history['accuracy'], label='Training Accuracy', color='blue', linewidth=2)
-            ax1.set_title('Model Accuracy')
-            ax1.set_xlabel('Epoch')
-            ax1.set_ylabel('Accuracy')
-            ax1.legend()
-            ax1.grid(True, linestyle='--', alpha=0.7)
-            
-            # Loss plot
-            ax2.plot(history['loss'], label='Training Loss', color='red', linewidth=2)
-            ax2.set_title('Model Loss')
-            ax2.set_xlabel('Epoch')
-            ax2.set_ylabel('Loss')
-            ax2.legend()
-            ax2.grid(True, linestyle='--', alpha=0.7)
-            
-            st.pyplot(fig)
-else:
-    st.error(f"Dataset not found at `{dataset_path}`. Please ensure the file exists.")
+                    st.warning("No predictions available.")
+            except Exception as e:
+                st.error(f"Error during prediction: {e}")
+    
+    with tab2:
+        st.header("Complete Sentence")
+        st.write("Start typing a sentence and let the model complete it automatically.")
+        
+        user_input = st.text_input("Enter incomplete sentence:", placeholder="e.g., 'machine learning'", key="complete_input")
+        num_words = st.slider("Words to add:", 1, 10, 3)
+        
+        if user_input:
+            try:
+                completed = autocomplete_sentence(model, tokenizer, metadata, user_input, words_to_add=num_words)
+                st.info(f"**Original:** {user_input}")
+                st.success(f"**Completed:** {completed}")
+            except Exception as e:
+                st.error(f"Error during completion: {e}")
+    
+    with tab3:
+        st.header("Model Evaluation Metrics")
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.metric("Total Epochs", metadata["epochs"])
+            st.metric("Vocabulary Size", metadata["total_words"])
+            st.metric("Max Sequence Length", metadata["max_sequence_len"])
+        
+        with col2:
+            st.metric("Training Sequences", metadata["num_sequences"])
+            st.metric("Dataset Sentences", metadata["num_sentences"])
+            final_accuracy = history["accuracy"][-1]
+            st.metric("Final Accuracy", f"{final_accuracy*100:.2f}%")
+        
+        st.subheader("Training History")
+        
+        # Create figure with loss and accuracy
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Loss plot
+        ax1.plot(history["loss"], linewidth=2, color='#e74c3c')
+        ax1.set_xlabel("Epoch", fontsize=12)
+        ax1.set_ylabel("Loss", fontsize=12)
+        ax1.set_title("Training Loss Over Epochs", fontsize=14, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+        
+        # Accuracy plot
+        ax2.plot(history["accuracy"], linewidth=2, color='#2ecc71')
+        ax2.set_xlabel("Epoch", fontsize=12)
+        ax2.set_ylabel("Accuracy", fontsize=12)
+        ax2.set_title("Training Accuracy Over Epochs", fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        
+        st.pyplot(fig)
+        
+except FileNotFoundError:
+    st.error("⚠️ Model files not found. Please run `train_model.py` first to train and save the model.")
